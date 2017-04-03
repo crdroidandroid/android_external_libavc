@@ -1417,7 +1417,7 @@ WORD32 ih264d_allocate_static_bufs(iv_obj_t **dec_hdl, void *pv_api_ip, void *pv
     ps_dec->pu4_mbaff_wt_mat = pv_buf;
 
     size = sizeof(UWORD32) * 2 * 3
-                        * (MAX_FRAMES * MAX_FRAMES);
+                        * ((MAX_FRAMES << 1) * (MAX_FRAMES << 1));
     pv_buf = pf_aligned_alloc(pv_mem_ctxt, 128, size);
     RETURN_IF((NULL == pv_buf), IV_FAIL);
     ps_dec->pu4_wts_ofsts_mat = pv_buf;
@@ -1765,15 +1765,7 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
 
     ps_dec->i4_frametype = -1;
     ps_dec->i4_content_type = -1;
-    /*
-     * For field pictures, set the bottom and top picture decoded u4_flag correctly.
-     */
-    {
-        if((TOP_FIELD_ONLY | BOT_FIELD_ONLY) == ps_dec->u1_top_bottom_decoded)
-        {
-            ps_dec->u1_top_bottom_decoded = 0;
-        }
-    }
+
     ps_dec->u4_slice_start_code_found = 0;
 
     /* In case the deocder is not in flush mode(in shared mode),
@@ -1927,7 +1919,7 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
     ps_dec->u2_cur_slice_num = 0;
     ps_dec->cur_dec_mb_num = 0;
     ps_dec->cur_recon_mb_num = 0;
-    ps_dec->u4_first_slice_in_pic = 2;
+    ps_dec->u4_first_slice_in_pic = 1;
     ps_dec->u1_first_pb_nal_in_pic = 1;
     ps_dec->u1_slice_header_done = 0;
     ps_dec->u1_dangling_field = 0;
@@ -1989,7 +1981,9 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
         if(buflen == -1)
             buflen = 0;
         /* Ignore bytes beyond the allocated size of intermediate buffer */
-        buflen = MIN(buflen, buf_size);
+        /* Since 8 bytes are read ahead, ensure 8 bytes are free at the
+        end of the buffer, which will be memset to 0 after emulation prevention */
+        buflen = MIN(buflen, buf_size - 8);
 
         bytes_consumed = buflen + u4_length_of_start_code;
         ps_dec_op->u4_num_bytes_consumed += bytes_consumed;
@@ -2083,6 +2077,7 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
             {
                 /* a start code has already been found earlier in the same process call*/
                 frame_data_left = 0;
+                header_data_left = 0;
                 continue;
             }
 
@@ -2164,8 +2159,9 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
         WORD32 prev_slice_err;
         pocstruct_t temp_poc;
         WORD32 ret1;
-
-        num_mb_skipped = (ps_dec->u2_frm_ht_in_mbs * ps_dec->u2_frm_wd_in_mbs)
+        WORD32 ht_in_mbs;
+        ht_in_mbs = ps_dec->u2_pic_ht >> (4 + ps_dec->ps_cur_slice->u1_field_pic_flag);
+        num_mb_skipped = (ht_in_mbs * ps_dec->u2_frm_wd_in_mbs)
                             - ps_dec->u2_total_mbs_coded;
 
         if(ps_dec->u4_first_slice_in_pic && (ps_dec->u4_pic_buf_got == 0))
@@ -2318,14 +2314,11 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
         /* if new frame in not found (if we are still getting slices from previous frame)
          * ih264d_deblock_display is not called. Such frames will not be added to reference /display
          */
-        if((ps_dec->ps_dec_err_status->u1_err_flag & REJECT_CUR_PIC) == 0)
+        if (((ps_dec->ps_dec_err_status->u1_err_flag & REJECT_CUR_PIC) == 0)
+                && (ps_dec->u4_pic_buf_got == 1))
         {
             /* Calling Function to deblock Picture and Display */
             ret = ih264d_deblock_display(ps_dec);
-            if(ret != 0)
-            {
-                return IV_FAIL;
-            }
         }
 
 
@@ -2421,6 +2414,37 @@ WORD32 ih264d_video_decode(iv_obj_t *dec_hdl, void *pv_api_ip, void *pv_api_op)
 
         }
     }
+
+    if((TOP_FIELD_ONLY | BOT_FIELD_ONLY) == ps_dec->u1_top_bottom_decoded)
+    {
+        ps_dec->u1_top_bottom_decoded = 0;
+    }
+    /*--------------------------------------------------------------------*/
+    /* Do End of Pic processing.                                          */
+    /* Should be called only if frame was decoded in previous process call*/
+    /*--------------------------------------------------------------------*/
+    if(ps_dec->u4_pic_buf_got == 1)
+    {
+        if(1 == ps_dec->u1_last_pic_not_decoded)
+        {
+            ret = ih264d_end_of_pic_dispbuf_mgr(ps_dec);
+
+            if(ret != OK)
+                return ret;
+
+            ret = ih264d_end_of_pic(ps_dec);
+            if(ret != OK)
+                return ret;
+        }
+        else
+        {
+            ret = ih264d_end_of_pic(ps_dec);
+            if(ret != OK)
+                return ret;
+        }
+
+    }
+
 
     /*Data memory barrier instruction,so that yuv write by the library is complete*/
     DATA_SYNC();
